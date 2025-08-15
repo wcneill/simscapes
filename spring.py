@@ -87,28 +87,29 @@ class StateSpaceModel(nn.Module):
         self.opt = opt
         self.integrand = partial(ode, system_matrix, input_matrix, forcing_function)
 
-    def forward(self, t_i: torch.Tensor, x_i: torch.Tensor, dt):
+    def forward(self, time: torch.Tensor, state: torch.Tensor):
         """
+        Execute the state space equations with a given state vector. Calculates both the
+        state derivative and the system output.
 
         Args:
-            t_i: The current time
-            x_i: The current state
-            dt: timestep
+            time: The current time.
+            state: The current state, or solution of the system.
 
         Returns:
-            state: The new state.
+            dx: The derivative of the state
             out: the new state space output.
 
         """
-        integrand = partial(ode, self.A, self.B, self.u)
-        state = rk4_step(t_i, x_i, dt, integrand)
-        out = self.C @ state + self.D @ self.u(t_i)
 
-        return state, out
+        dx = self.A @ state + self.B @ self.u(time)
+        out = self.C @ state + self.D @ self.u(time)
 
-    def run(self, device, t_0, t_n, dt, y_0):
+        return dx, out
+
+    def run(self, device, t_0, t_n, dt, y_0, compute_output=False):
         """
-        Run the solver continuously for a set amount of time.
+        Run the solver continuously for a set amount of time. Returns
 
         Args:
             device: CUDA or CPU
@@ -116,6 +117,7 @@ class StateSpaceModel(nn.Module):
             t_n: stop time
             dt: time step size
             y_0: initial conditions
+            compute_output: Whether to transform the states with C and D matrices.
 
         Returns:
             State space system's outputs
@@ -126,63 +128,70 @@ class StateSpaceModel(nn.Module):
             y_0 = y_0.to(device)
             time = torch.arange(t_0, t_n + 2 * dt, dt).to(device)
 
-            # initialize the solution tensor from initial state
-            rows = y_0.dim()
+            # initialize the tensor containing states
+            state_rows = self.A.size(-1)
             columns = int(2 + (t_n - t_0) // dt)
-            solution = torch.ones((rows, columns), device=device) * (self.C @ y_0 + self.D @ self.u(time[0]))
+            states = torch.ones((state_rows, columns), device=device) * y_0
 
             # run integrator
             integrand = partial(ode, self.A, self.B, self.u)
             for i, state in enumerate(run_rk4(integrand, t_0, t_n, dt, y_0), start=1):
                 # derive outputs from integrated state, add to solution tensor
-                out = self.C @ state + self.D @ self.u(time[i])
-                solution[:, i:i + 1] = out
+                states[:, i:i + 1] = state
 
-        return solution
+            if compute_output:
+                output = self.C @ states + self.B @ self.u(time)
+                return output
 
+            return states
 
-    def optimize(self, device, y_init, dt, data_loader, epocs, lr=0.001):
+    def optimize(self, device, target_loader, epochs=1, lr=0.001):
         """
         Optimizes state space matrices via back propagation.
 
         Args:
-            device: Device to train parameters on.
-            y_init: Initial state of the system.
-            dt: The timestep of the underlying solver. Should match the timestep in the dataset.
-            data_loader: Contains real world data (t, y(t))
-            epocs: The number of times the entire dataset is iterated over during training.
+            target_data: Dataset containing
+            epochs: The number of times the entire dataset is iterated over during training.
             lr: learning rate
+            kwargs: Additional keyword arguments to pass to the data_loader that is cre
         """
-        torch.autograd.set_detect_anomaly(True)
-        y_init = y_init.to(device)
 
-        opt = self.opt(self.parameters(), lr=lr)
         loss = []
-
-        for i in range(epocs):
-            epoch_loss = self.train_one_epoch(device, y_init, dt, data_loader, opt)
+        opt = self.opt(self.parameters(), lr=lr)
+        for i in range(epochs):
+            epoch_loss = self.train_one_epoch(device, target_loader, opt)
             loss.append(epoch_loss)
             print(f"Epoch {i} loss: {epoch_loss}")
 
         return loss
 
 
-    def train_one_epoch(self, device, y_init, dt, data_loader, opt):
-
-        curr_states = y_init  # TODO: add check to make sure input initial state equals target initial state
+    def train_one_epoch(self, device, data_loader, opt):
 
         running_loss = 0.0
-        for i, (t_i, target_state) in enumerate(data_loader):
-            t_i, target_state = t_i.to(device), target_state.to(device)
+        for i, (t_i, target_x, target_y, target_dx) in enumerate(data_loader):
+
+            t_i = t_i.to(device)
+            target_x = target_x.to(device)
+            target_y = target_y.to(device)
+            target_dx = target_dx.to(device)
+
             opt.zero_grad()
 
-            y_states, y_output = self.forward(t_i, curr_states, dt)
-            loss = nn.functional.mse_loss(y_output, target_state.squeeze(0))
-            loss.backward()
+            # Run the true states through this model's state space model
+            est_dx, est_y = self.forward(t_i, target_x)
+
+            # compute the loss on dx
+            dx_loss = nn.functional.mse_loss(est_dx, target_dx)
+            dx_loss.backward()
+
+            # compute the loss on output
+            out_loss = nn.functional.mse_loss(est_y, target_y)
+            out_loss.backward()
             opt.step()
 
-            curr_states = y_states.detach()
-            running_loss += loss.item()
+            avg_batch_loss = (out_loss.item() + dx_loss.item()) / 2
+            running_loss += avg_batch_loss
 
         return running_loss / len(data_loader)
 
@@ -190,7 +199,7 @@ class StateSpaceModel(nn.Module):
 if __name__ == '__main__':
 
     from utils.datagen import generate_spring_data
-    from utils.datasets import TensorData
+    from utils.datasets import StateSpaceData
     import matplotlib.pyplot as plt
     from pathlib import Path
 
@@ -208,69 +217,67 @@ if __name__ == '__main__':
     # initial conditions
     y0 = torch.tensor([[2.0], [0.0]])  # position and velocity
 
-    # if we have not already generated "real world" truth data, do so.
-    if Path("solution.pt").exists():
-        true_solution = torch.load("solution.pt")
-        A = torch.load("A.pt")
-        B = torch.load("B.pt")
-        C = torch.load("C.pt")
-        D = torch.load("D.pt")
-    else:
-        # generate data and the associated state matrices
-        true_solution, A, B, C, D = generate_spring_data(device_type, t0, tn, delta_t, y0, forcing_func, save=True)
+    # Generate real-world "sensed" data
+    spring_data, A, B, C, D = generate_spring_data(device_type, t0, tn, delta_t, y0, forcing_func, save=True)
 
-    # plot solution
-    true_solution = true_solution.detach().to('cpu')
-
+    # generate errored state matrices
     error = partial(torch.normal, 0.0, 0.33)
     A = A + error(A.shape)
     B = B + error(B.shape)
     C = C + error(C.shape)
     D = D + error(D.shape)
 
-    t = torch.arange(t0, tn + delta_t, delta_t)
-
     # run unoptimized model to get estimated solution.
     est_model = StateSpaceModel(A, B, C, D, forcing_func).to(device_type)
-    est_solution = est_model.run(device_type, t0, tn, delta_t, y0).detach().to('cpu')
+    est_states = est_model.run(device_type, t0, tn, delta_t, y0).detach().to('cpu')
 
-    # load training data into data loader
-    truth_data = torch.vstack([t, true_solution])
-    dataset = TensorData(truth_data, 1, arrangement="long")
+    # Create dataloader and run the optimizer
+    spring_loader = DataLoader(spring_data, batch_size=10, shuffle=True)
+    est_model.optimize(device_type, spring_loader, epochs=100)
 
-    # optimize the model based on new "real world" data
-    training_loader = DataLoader(dataset, batch_size=1)
-    est_model.optimize(device_type, y0, delta_t, training_loader, lr=0.003, epocs=2000)
-
-    # get estimated solution from updated model
-    new_est_solution = est_model.run(device_type, t0, tn, delta_t, y0).detach().to('cpu')
+    # re-run the optimized model
+    new_est_states = est_model.run(device_type, t0, tn, delta_t, y0, compute_output=False).detach().to('cpu')
 
     # plot the true and estimated solutions side by side.
-    fig, (ax1, ax2, ax3, ax4) = plt.subplots(nrows=4)
+    fig, axes = plt.subplots(nrows=4)
 
     # plot pre-optimization results next to truth data
-    ax1.plot(t, true_solution[0], label="position", c="blue")
-    ax2.plot(t, true_solution[1], label="velocity", c="orange")
-    ax1.plot(t, est_solution[0], "--", c="cornflowerblue", label="old est position")
-    ax2.plot(t, est_solution[1], "--", c="wheat", label="old est velocity")
+    t = torch.arange(t0, tn + delta_t, delta_t)
 
-    # plot the post-optimized data to see the improvement next to real-world data.
-    ax3.plot(t, true_solution[0], label="position", c="blue")
-    ax4.plot(t, true_solution[1], label="velocity", c="orange")
-    ax3.plot(t, new_est_solution[0], "--", c="cornflowerblue", label="new est position")
-    ax4.plot(t, new_est_solution[1], "--", c="wheat", label="new est velocity")
+    c = ["cornflowerblue", "wheat"]
+    o = [est_states, new_est_states]
 
-    loc = "lower right"
-    ax1.legend(loc=loc)
-    ax2.legend(loc=loc)
-    ax3.legend(loc=loc)
-    ax4.legend(loc=loc)
+    for i, ax in enumerate(axes):
+
+        ix = i % 2
+
+        if ix == 0:
+            # plot position information before and after optimization
+            ax.plot(t, spring_data["x"][f"x_{0}"], label="sensed position", c="blue")
+            if i == 0:
+                ax.plot(t, o[0][ix], "--", label="estimated position", c=c[ix])
+            else:
+                ax.plot(t, o[1][ix], "--", label=" updated position estimate", c=c[ix])
+        else:
+            # plot velocity information, before and after optimization
+            ax.plot(t, spring_data["x"][f"x_{ix}"], label="sensed velocity", c="orange")
+            if i == 1:
+                ax.plot(t, o[0][ix], "--", label="estimated velocity", c=c[ix])
+            else:
+                ax.plot(t, o[1][ix], "--", label="updated velocity estimate", c=c[ix])
+
+        ax.legend(loc="lower right")
+
     plt.tight_layout()
     plt.show()
+    #
+    # true_params = (A, B, C, D)
+    # for p1, p2 in zip(est_model.named_parameters(), true_params):
+    #     print(f" Comparison of Matrix {p1[0]}:")
+    #     print(p1[1])
+    #     print(p2)
+    #     print("\n")
 
-    true_params = (A, B, C, D)
-    for p1, p2 in zip(est_model.named_parameters(), true_params):
-        print(f" Comparison of Matrix {p1[0]}:")
-        print(p1[1])
-        print(p2)
-        print("\n")
+"""
+Workflow: Simulation 
+"""
